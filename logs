@@ -1,0 +1,79 @@
+WITH logs AS (
+  SELECT
+    date_format(to_timestamp(get_json_object(j, '$.date')), 'MMMM/yy') AS mes,
+    get_json_object(j, '$.tenant_name') AS tenant_name,
+    get_json_object(j, '$.client_name') AS client_name,
+    get_json_object(j, '$.user_id')     AS user_id,
+    get_json_object(j, '$.type')        AS tipo_evento
+  FROM (SELECT CAST(`value` AS STRING) AS j
+        FROM   fp.bronze.authentication_auth0_logs
+        WHERE  __platform_date >= 20260801)
+),
+classificado AS (
+  SELECT *,
+    -- qual fluxo o evento revela (s/ssa/sertft ficam NULL: sozinhos não definem o fluxo)
+    CASE
+      WHEN tipo_evento IN ('seacft','sdeleacft')                 THEN 'Authorization Code'
+      WHEN tipo_evento = 'scoa'                                  THEN 'Cross-Origin (login embutido)'
+      WHEN tipo_evento IN ('sepft','seotpft','seoobft','sercft') THEN 'Password (ROPG)'
+      WHEN tipo_evento IN ('sepkotpft','sepkoobft','sepkrcft')   THEN 'Passkey'
+      WHEN tipo_evento = 'sens'                                  THEN 'Native Social Login'
+      WHEN tipo_evento = 'sede'                                  THEN 'Device Code'
+      WHEN tipo_evento = 'secte'                                 THEN 'Custom Token Exchange'
+      WHEN tipo_evento = 'ciba_exchange_succeeded'               THEN 'CIBA'
+      WHEN tipo_evento = 'success_on_behalf_of_token_exchange'   THEN 'On-Behalf-Of'
+      WHEN tipo_evento = 'idjag_exchange_succeeded'              THEN 'ID-JAG (cross-app)'
+      WHEN tipo_evento = 'sd'                                    THEN 'Delegation (legado)'
+      WHEN tipo_evento = 'seccft'                                THEN 'Client Credentials (M2M)'
+    END AS fluxo,
+    -- em qual contador o evento entra
+    CASE
+      WHEN tipo_evento IN ('s','sdel','sepft','seotpft','seoobft','sercft',
+                           'sepkotpft','sepkoobft','sepkrcft','sens','sede','secte',
+                           'ciba_exchange_succeeded','success_on_behalf_of_token_exchange',
+                           'idjag_exchange_succeeded')    THEN 'login_usuario'
+      WHEN tipo_evento = 'seccft'                         THEN 'login_m2m'
+      WHEN tipo_evento IN ('sertft','seta')               THEN 'refresh_token'
+      WHEN tipo_evento IN ('ssa','sdelsa')                THEN 'silent_auth'
+    END AS categoria
+  FROM logs
+  WHERE tipo_evento IN ('s','sdel','scoa','seacft','sdeleacft','ssa','sdelsa','sertft','seta',
+                        'sepft','seotpft','seoobft','sercft','sepkotpft','sepkoobft','sepkrcft',
+                        'sens','sede','secte','ciba_exchange_succeeded',
+                        'success_on_behalf_of_token_exchange','idjag_exchange_succeeded',
+                        'seccft','sd')
+),
+agg AS (
+  SELECT
+    mes, tenant_name, client_name,
+    collect_set(fluxo)                               AS fluxos,
+    count_if(tipo_evento IN ('s','sdel'))            AS qtd_universal_login,
+    count_if(tipo_evento IN ('seacft','sdeleacft'))  AS qtd_troca_code,
+    count(DISTINCT user_id)                          AS qtde_usuarios_unicos,
+    count_if(categoria = 'login_usuario')            AS logins_usuario,
+    count_if(categoria = 'login_m2m')                AS logins_m2m,
+    count_if(categoria = 'refresh_token')            AS refresh_token,
+    count_if(categoria = 'silent_auth')              AS silent_auth,
+    count(*)                                         AS eventos_total
+  FROM classificado
+  GROUP BY ALL
+)
+SELECT
+  mes,
+  tenant_name,
+  client_name,
+  coalesce(
+    nullif(concat_ws(' + ', array_sort(
+      IF(qtd_universal_login > 0 AND qtd_troca_code = 0,     -- login sem troca de code = Implicit
+         array_union(fluxos, array('Implicit')),
+         fluxos))), ''),
+    IF(refresh_token > 0, 'Somente Refresh Token', 'Somente Silent Auth')
+  )                     AS forma_autenticacao,
+  qtde_usuarios_unicos,
+  logins_usuario,
+  logins_m2m,
+  refresh_token,
+  silent_auth,
+  eventos_total
+FROM agg
+ORDER BY tenant_name, client_name, mes
